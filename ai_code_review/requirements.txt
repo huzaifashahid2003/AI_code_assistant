@@ -8,12 +8,11 @@ streamlit>=1.33.0
 requests>=2.31.0
 
 # ── Embeddings & Vector Store ────────────────────────────────────────────────
-sentence-transformers>=2.7.0
 faiss-cpu>=1.8.0
 numpy>=1.26.0
 
-# ── LLM Integration ──────────────────────────────────────────────────────────
-openai>=1.25.0
+# ── LLM Integration (Google Gemini) ─────────────────────────────────────────
+google-generativeai>=0.7.0
 
 # ── Dev / Testing ────────────────────────────────────────────────────────────
 pytest>=8.2.0
