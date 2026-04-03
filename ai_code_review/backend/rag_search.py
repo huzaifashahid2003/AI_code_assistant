@@ -17,11 +17,14 @@ making it trivial to enable real AI by setting the GEMINI_API_KEY env variable.
 from __future__ import annotations
 
 import hashlib
+import logging
 import os
 from dataclasses import dataclass
 from typing import List
 
 import numpy as np
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Optional third-party imports
@@ -238,25 +241,46 @@ def retrieve_relevant_chunks(
 # ---------------------------------------------------------------------------
 
 _REVIEW_PROMPT = """\
-You are an experienced Python code reviewer. Analyse the following code chunks \
-and provide a thorough, constructive review.
+You are an expert Python code reviewer conducting a professional code review.
+Analyse the following Python code chunks and produce a structured report.
 
-Focus on:
-1. **Code quality** — readability, structure, adherence to PEP 8.
-2. **Performance** — algorithmic inefficiencies, redundant computation.
-3. **Naming conventions** — clarity of variable, function, and class names.
-4. **Possible bugs** — edge cases, missing error handling, logic errors.
+For each issue, reference the exact function or class name and the approximate
+line numbers provided in the chunk headers (e.g. "In `divide()` (Lines 5-7):").
 
-For each issue found:
-- State the relevant function or class name.
-- Describe the problem concisely.
-- Suggest a concrete improvement.
+Structure your entire response using EXACTLY these four sections in this order.
+Only include a section if you have findings for it — otherwise omit it.
 
---- CODE CHUNKS ---
+---
+
+## 1. Code Quality Issues
+List issues related to readability, PEP 8 violations, overly complex logic,
+missing docstrings, or poor code organisation.
+
+## 2. Performance Improvements
+Highlight inefficiencies, unnecessary computations, suboptimal data structures,
+or operations that could be vectorised or cached.
+
+## 3. Naming & Style Suggestions
+Point out unclear variable names, non-`snake_case` identifiers, magic numbers,
+or style inconsistencies that reduce readability.
+
+## 4. Potential Bugs
+Identify logic errors, unhandled edge cases (e.g. division by zero, empty
+inputs, off-by-one), missing input validation, or other likely runtime failures.
+
+---
+
+For every finding use this format:
+- **`FunctionOrClassName` (Lines X-Y):** Brief description of the issue.
+  *Suggestion:* Concrete, actionable fix.
+
+If the code is clean in a category, write: *(No issues found.)*
+
+--- CODE ---
 {code_context}
--------------------
+------------
 
-Respond in clear, structured Markdown."""
+Be concise, professional, and constructive. Respond in well-formatted Markdown."""
 
 
 # ---------------------------------------------------------------------------
@@ -274,7 +298,8 @@ def generate_code_review(chunks: List[str]) -> str:
 
     Args:
         chunks: Source-code strings to review (typically retrieved by
-                :func:`retrieve_relevant_chunks`).
+                :func:`retrieve_relevant_chunks`).  Each string may include a
+                metadata header of the form ``# Type: Name | Lines X-Y``.
 
     Returns:
         Review text formatted as Markdown.
@@ -283,21 +308,40 @@ def generate_code_review(chunks: List[str]) -> str:
         return "No code chunks provided — nothing to review."
 
     code_context = "\n\n---\n\n".join(
-        f"### Chunk {i + 1}\n```python\n{chunk.strip()}\n```"
+        f"#### Chunk {i + 1}\n```python\n{chunk.strip()}\n```"
         for i, chunk in enumerate(chunks)
     )
     prompt = _REVIEW_PROMPT.format(code_context=code_context)
 
     if _GEMINI_AVAILABLE and os.environ.get("GEMINI_API_KEY"):
-        return _call_gemini(prompt)
+        logger.info("Calling Gemini API for code review (%d chunks).", len(chunks))
+        try:
+            review = _call_gemini(prompt)
+            logger.info("Gemini review generated successfully.")
+            return review
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Gemini API call failed: %s", exc)
+            return (
+                "## AI Code Review\n\n"
+                f"> **Warning:** The AI service returned an error: `{exc}`\n>\n"
+                "> Showing placeholder review instead.\n\n"
+                + _placeholder_review(chunks)
+            )
+    logger.info("Gemini unavailable — returning placeholder review.")
     return _placeholder_review(chunks)
 
 
 def _call_gemini(prompt: str) -> str:
-    """Send a prompt to Gemini and return the text response."""
+    """Send a prompt to Gemini and return the text response.
+
+    Raises:
+        RuntimeError: If the API returns no text content.
+    """
     genai.configure(api_key=os.environ["GEMINI_API_KEY"])
     model = genai.GenerativeModel(GEMINI_REVIEW_MODEL)
     response = model.generate_content(prompt)
+    if not response.text:
+        raise RuntimeError("Gemini returned an empty response.")
     return response.text
 
 
@@ -305,25 +349,31 @@ def _placeholder_review(chunks: List[str]) -> str:
     """
     Return a structured placeholder review when Gemini is unavailable.
 
-    Still lists every chunk and its first line so the pipeline is fully
-    testable end-to-end without any API credentials.
+    Follows the same four-section structure as the real prompt so the UI
+    renders consistently regardless of whether the LLM is available.
     """
-    lines = [
-        "## AI Code Review (Placeholder)\n",
-        "> **Note:** Set the `GEMINI_API_KEY` environment variable and install "
-        "`google-generativeai` to enable real AI-powered review.\n",
-        f"**Chunks analysed:** {len(chunks)}\n",
-        "### Detected chunks\n",
-    ]
+    chunk_list = ""
     for i, chunk in enumerate(chunks, 1):
         first_line = chunk.strip().splitlines()[0] if chunk.strip() else "<empty>"
-        lines.append(f"- **Chunk {i}:** `{first_line}`")
+        chunk_list += f"- **Chunk {i}:** `{first_line}`\n"
 
-    lines += [
-        "\n### Placeholder observations\n",
-        "- Ensure all public functions have docstrings.",
-        "- Check that variable names are descriptive and follow `snake_case`.",
-        "- Verify edge cases are handled (empty inputs, `None` values).",
-        "- Avoid deeply nested logic; prefer early returns.",
-    ]
-    return "\n".join(lines)
+    return (
+        "## AI Code Review (Placeholder Mode)\n\n"
+        "> **Note:** Set the `GEMINI_API_KEY` environment variable and install\n"
+        "> `google-generativeai` to enable real AI-powered review.\n\n"
+        f"**Chunks analysed:** {len(chunks)}\n\n"
+        f"{chunk_list}\n"
+        "---\n\n"
+        "## 1. Code Quality Issues\n\n"
+        "- Ensure all public functions and classes have docstrings.\n"
+        "- Keep functions short and focused on a single responsibility.\n\n"
+        "## 2. Performance Improvements\n\n"
+        "- Avoid redundant computations inside loops.\n"
+        "- Use built-in functions (`sum`, `max`, `any`) where applicable.\n\n"
+        "## 3. Naming & Style Suggestions\n\n"
+        "- Use `snake_case` for variables and functions; `PascalCase` for classes.\n"
+        "- Replace magic numbers with named constants.\n\n"
+        "## 4. Potential Bugs\n\n"
+        "- Verify edge cases: empty inputs, `None` values, division by zero.\n"
+        "- Add input validation at all public API boundaries.\n"
+    )

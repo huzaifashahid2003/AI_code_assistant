@@ -5,7 +5,8 @@ Features:
     - Upload a Python (.py) file (or use built-in sample code).
     - Enter a review query and click "Analyze Code".
     - Sends the file to FastAPI /upload, then calls /review for AI feedback.
-    - Displays review suggestions in a formatted text area.
+    - Displays review suggestions as rendered Markdown.
+    - Lets the user download the review as a .txt file.
 """
 
 from pathlib import Path
@@ -80,7 +81,7 @@ def request_review(filename: str, query: str) -> dict:
 
 def run_analysis(filename: str, content: bytes, query: str) -> None:
     """Orchestrate upload → review and render results in the Streamlit UI."""
-    with st.spinner("Analyzing..."):
+    with st.spinner("Uploading and analysing — this may take a few seconds..."):
         try:
             upload_to_backend(filename, content)
             data = request_review(filename, query)
@@ -100,6 +101,9 @@ def run_analysis(filename: str, content: bytes, query: str) -> None:
                 detail = str(exc)
             st.error(f"Backend error: {detail}")
             return
+        except requests.exceptions.RequestException as exc:
+            st.error(f"Unexpected network error: {exc}")
+            return
 
     review_text = data.get("review", "").strip()
     if not review_text:
@@ -108,16 +112,12 @@ def run_analysis(filename: str, content: bytes, query: str) -> None:
 
     total = data.get("total_chunks", "?")
     reviewed = data.get("reviewed_chunks", "?")
-    st.success(f"Review complete — {reviewed} of {total} code chunks analysed.")
 
-    st.subheader("Review Suggestions")
-    st.text_area(
-        label="",
-        value=review_text,
-        height=420,
-        disabled=True,
-        key="review_output",
-    )
+    # Persist in session state so the download button survives re-runs
+    st.session_state["review_text"] = review_text
+    st.session_state["review_filename"] = filename
+    st.session_state["review_total"] = total
+    st.session_state["review_reviewed"] = reviewed
 
 
 # ---------------------------------------------------------------------------
@@ -130,8 +130,18 @@ st.set_page_config(
     layout="centered",
 )
 
-st.title("AI Code Review Assistant")
-st.caption("Upload a Python file and ask the AI to review it.")
+st.title("🔍 AI Code Review Assistant")
+st.caption("Upload a Python file and get an AI-powered code review instantly.")
+
+# Initialise session state keys
+if "review_text" not in st.session_state:
+    st.session_state["review_text"] = ""
+if "review_filename" not in st.session_state:
+    st.session_state["review_filename"] = ""
+if "review_total" not in st.session_state:
+    st.session_state["review_total"] = "?"
+if "review_reviewed" not in st.session_state:
+    st.session_state["review_reviewed"] = "?"
 
 st.divider()
 
@@ -183,3 +193,24 @@ if st.button("Analyze Code", type="primary"):
             "No file selected. Upload a .py file or check "
             "'Use built-in sample code instead'."
         )
+
+# --- Review results (rendered after analysis or from session state) ---
+if st.session_state["review_text"]:
+    st.divider()
+    total = st.session_state["review_total"]
+    reviewed = st.session_state["review_reviewed"]
+    fname = st.session_state["review_filename"]
+
+    st.success(f"Review complete — {reviewed} of {total} code chunk(s) analysed from `{fname}`.")
+
+    st.subheader("Review Suggestions")
+    st.markdown(st.session_state["review_text"])
+
+    st.divider()
+    st.download_button(
+        label="⬇️  Download Review (.txt)",
+        data=st.session_state["review_text"],
+        file_name=f"review_{Path(fname).stem}.txt",
+        mime="text/plain",
+        help="Save the full review report as a plain-text file.",
+    )

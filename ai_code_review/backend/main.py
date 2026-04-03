@@ -3,8 +3,10 @@ main.py — FastAPI server for AI Code Review Assistant.
 
 Endpoints:
     POST /upload  — Accept a Python .py file, save it, and return metadata.
+    POST /review  — Run an AI code review on an uploaded .py file.
 """
 
+import logging
 import os
 import shutil
 from pathlib import Path
@@ -15,6 +17,17 @@ from pydantic import BaseModel
 
 from code_processing import chunk_code
 from rag_search import create_faiss_index, generate_code_review, retrieve_relevant_chunks
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s  %(levelname)-8s  %(name)s — %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # App setup
@@ -79,6 +92,8 @@ async def upload_file(file: UploadFile = File(...)) -> dict:
     with destination.open("wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
 
+    logger.info("File uploaded: '%s' → %s", safe_name, destination)
+
     return {
         "filename": safe_name,
         "saved_to": str(destination.relative_to(BASE_DIR)),
@@ -137,7 +152,14 @@ def review_file(request: ReviewRequest) -> dict:
         )
 
     # 2. Read content
-    code_text = file_path.read_text(encoding="utf-8")
+    try:
+        code_text = file_path.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        raise HTTPException(
+            status_code=400,
+            detail=f"'{safe_name}' could not be decoded as UTF-8. Ensure the file uses UTF-8 encoding.",
+        )
+
     if not code_text.strip():
         raise HTTPException(
             status_code=400,
@@ -155,7 +177,14 @@ def review_file(request: ReviewRequest) -> dict:
             ),
         )
 
-    chunk_sources = [c.source for c in chunks]
+    logger.info("'%s' split into %d chunk(s).", safe_name, len(chunks))
+
+    # Build enriched chunk texts that include name + line numbers so the LLM
+    # can reference them precisely in its output.
+    chunk_sources = [
+        f"# {c.chunk_type.title()}: {c.name} | Lines {c.start_line}-{c.end_line}\n{c.source}"
+        for c in chunks
+    ]
 
     # 4. Build FAISS index
     store = create_faiss_index(chunk_sources)
@@ -164,7 +193,9 @@ def review_file(request: ReviewRequest) -> dict:
     relevant = retrieve_relevant_chunks(store, request.query)
 
     # 6. Generate review
+    logger.info("Generating review for '%s' using %d relevant chunk(s).", safe_name, len(relevant))
     review_text = generate_code_review(relevant)
+    logger.info("Review generated for '%s'.", safe_name)
 
     return {
         "filename": safe_name,
