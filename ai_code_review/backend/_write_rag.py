@@ -1,4 +1,9 @@
-from __future__ import annotations
+"""Write the full rag_search.py content to disk."""
+import os
+
+DEST = r"c:\Users\Huzaifa\OneDrive\Desktop\AI_Code_assistant\ai_code_review\backend\rag_search.py"
+
+CONTENT = r'''from __future__ import annotations
 import logging
 import math
 import os
@@ -29,8 +34,14 @@ def _get_groq_client():
         return None
 
 
+try:
+    import faiss  # type: ignore[import]
+    _FAISS_AVAILABLE = True
+except ImportError:
+    _FAISS_AVAILABLE = False
+
 GROQ_MODEL = "llama-3.3-70b-versatile"
-TFIDF_MAX_FEATURES = 512
+TFIDF_MAX_FEATURES = 512  # FAISS index dimension = min(vocab_size, 512)
 
 
 # ---------------------------------------------------------------------------
@@ -77,9 +88,7 @@ class _TFIDFVectorizer:
             tf = Counter(tokens)
             for term, count in tf.items():
                 if term in self.vocabulary_:
-                    mat[i, self.vocabulary_[term]] = (
-                        count * self.idf_[self.vocabulary_[term]]
-                    )
+                    mat[i, self.vocabulary_[term]] = count * self.idf_[self.vocabulary_[term]]
             norm = float(np.linalg.norm(mat[i]))
             if norm > 0.0:
                 mat[i] /= norm
@@ -87,116 +96,94 @@ class _TFIDFVectorizer:
 
 
 # ---------------------------------------------------------------------------
-# Vector store (pure numpy — no FAISS dependency)
+# FAISS store
 # ---------------------------------------------------------------------------
 
 @dataclass
-class VectorStore:
-    matrix: np.ndarray   # shape (n_chunks, vocab_size)
+class FAISSStore:
+    index: object                        # faiss.IndexFlatL2
     chunks: List[str]
-    vectorizer: Any = field(default=None)
+    dim: int
+    vectorizer: Any = field(default=None)  # _TFIDFVectorizer instance
 
 
-def create_faiss_index(chunks: List[str]) -> "VectorStore":
-    """Build a TF-IDF vector store from a list of text chunks."""
+def create_faiss_index(chunks: List[str]) -> "FAISSStore":
+    if not _FAISS_AVAILABLE:
+        raise ImportError(
+            "faiss-cpu is required. Install it with: pip install faiss-cpu"
+        )
     if not chunks:
-        raise ValueError("Cannot create a vector store from an empty chunk list.")
+        raise ValueError("Cannot create a FAISS index from an empty chunk list.")
 
     vec = _TFIDFVectorizer(max_features=TFIDF_MAX_FEATURES)
-    matrix = vec.fit_transform(chunks)   # shape: (n, vocab_size)
-    return VectorStore(matrix=matrix, chunks=chunks, vectorizer=vec)
+    embeddings = vec.fit_transform(chunks)   # shape: (n, dim)
+    dim = embeddings.shape[1]
+
+    index = faiss.IndexFlatL2(dim)
+    index.add(embeddings)
+
+    return FAISSStore(index=index, chunks=chunks, dim=dim, vectorizer=vec)
 
 
 def retrieve_relevant_chunks(
-    store: "VectorStore",
+    store: "FAISSStore",
     query: str,
     k: int = 20,
 ) -> List[str]:
-    """Return the top-k chunks most similar to *query* (cosine similarity)."""
     k = min(k, len(store.chunks))
     if store.vectorizer is not None:
-        query_vec = store.vectorizer.transform([query])  # (1, vocab_size)
+        query_vec = store.vectorizer.transform([query])  # shape: (1, dim)
     else:
-        query_vec = np.zeros((1, store.matrix.shape[1]), dtype=np.float32)
-
-    # Cosine similarity = dot product of L2-normalised vectors
-    # Both corpus rows and query are already L2-normalised by _TFIDFVectorizer
-    scores = store.matrix.dot(query_vec[0])   # (n,)
-    top_indices = np.argsort(scores)[::-1][:k]
-    return [store.chunks[i] for i in top_indices]
+        query_vec = np.zeros((1, store.dim), dtype=np.float32)
+    _, indices = store.index.search(query_vec, k)
+    return [store.chunks[i] for i in indices[0] if i != -1]
 
 
 # ---------------------------------------------------------------------------
-# Prompts
+# Code review prompt template
 # ---------------------------------------------------------------------------
 
-_REVIEW_PROMPT = (
-    "You are an expert Python code reviewer conducting a professional code review.\n"
-    "Analyse the following Python code chunks and produce a structured report.\n\n"
-    "For each issue, reference the exact function or class name and the approximate\n"
-    "line numbers provided in the chunk headers.\n\n"
-    "Structure your entire response using EXACTLY these four sections in this order.\n"
-    "Only include a section if you have findings for it -- otherwise omit it.\n\n"
-    "---\n\n"
-    "## 1. Code Quality Issues\n"
-    "List issues related to readability, PEP 8 violations, overly complex logic,\n"
-    "missing docstrings, or poor code organisation.\n\n"
-    "## 2. Performance Improvements\n"
-    "Highlight inefficiencies, unnecessary computations, suboptimal data structures,\n"
-    "or operations that could be vectorised or cached.\n\n"
-    "## 3. Naming & Style Suggestions\n"
-    "Point out unclear variable names, non-snake_case identifiers, magic numbers,\n"
-    "or style inconsistencies that reduce readability.\n\n"
-    "## 4. Potential Bugs\n"
-    "Identify logic errors, unhandled edge cases, missing input validation, or "
-    "other likely runtime failures.\n\n"
-    "---\n\n"
-    "For every finding use this format:\n"
-    "- **`FunctionOrClassName` (Lines X-Y):** Brief description of the issue.\n"
-    "  *Suggestion:* Concrete, actionable fix.\n\n"
-    "If the code is clean in a category, write: *(No issues found.)*\n\n"
-    "--- CODE ---\n"
-    "{code_context}\n"
-    "------------\n\n"
-    "Be concise, professional, and constructive. Respond in well-formatted Markdown."
-)
+_REVIEW_PROMPT = """\
+You are an expert Python code reviewer conducting a professional code review.
+Analyse the following Python code chunks and produce a structured report.
 
-_CORRECT_PROMPT = (
-    "You are an expert Python developer. Your task is to fix ALL bugs, errors, and "
-    "code quality issues in the Python code below.\n\n"
-    "Rules you MUST follow:\n"
-    "1. Return ONLY the corrected Python source code -- no explanations, no markdown "
-    "fences, no prose.\n"
-    "2. Fix every bug, logic error, unhandled edge case, PEP 8 violation, and "
-    "naming issue you find.\n"
-    "3. Do NOT add new features; only correct existing code.\n"
-    "4. Preserve the original structure, function names, and variable names unless "
-    "a name itself is the bug.\n\n"
-    "--- ORIGINAL CODE ---\n"
-    "{original_code}\n"
-    "---------------------\n\n"
-    "Output the corrected Python code only."
-)
+For each issue, reference the exact function or class name and the approximate
+line numbers provided in the chunk headers (e.g. "In `divide()` (Lines 5-7):").
 
+Structure your entire response using EXACTLY these four sections in this order.
+Only include a section if you have findings for it -- otherwise omit it.
 
-def _call_groq(client, prompt: str) -> str:
-    completion = client.chat.completions.create(
-        model=GROQ_MODEL,
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.2,
-    )
-    text = completion.choices[0].message.content
-    if not text:
-        raise RuntimeError("Groq returned an empty response.")
-    return text
+---
 
+## 1. Code Quality Issues
+List issues related to readability, PEP 8 violations, overly complex logic,
+missing docstrings, or poor code organisation.
 
-def _placeholder_review(chunks: List[str]) -> str:
-    chunk_list = "".join(
-        f"- **Chunk {i}:** `{chunk.strip().splitlines()[0] if chunk.strip() else '<empty>'}`\n"
-        for i, chunk in enumerate(chunks, 1)
-    )
-    return f"{len(chunks)}\n\n{chunk_list}\n"
+## 2. Performance Improvements
+Highlight inefficiencies, unnecessary computations, suboptimal data structures,
+or operations that could be vectorised or cached.
+
+## 3. Naming & Style Suggestions
+Point out unclear variable names, non-snake_case identifiers, magic numbers,
+or style inconsistencies that reduce readability.
+
+## 4. Potential Bugs
+Identify logic errors, unhandled edge cases (e.g. division by zero, empty
+inputs, off-by-one), missing input validation, or other likely runtime failures.
+
+---
+
+For every finding use this format:
+- **`FunctionOrClassName` (Lines X-Y):** Brief description of the issue.
+  *Suggestion:* Concrete, actionable fix.
+
+If the code is clean in a category, write: *(No issues found.)*
+
+--- CODE ---
+{code_context}
+------------
+
+Be concise, professional, and constructive. Respond in well-formatted Markdown."""
 
 
 def generate_code_review(chunks: List[str]) -> str:
@@ -228,7 +215,49 @@ def generate_code_review(chunks: List[str]) -> str:
     return _placeholder_review(chunks)
 
 
+def _call_groq(client, prompt: str) -> str:
+    """Send a prompt to Groq and return the text response."""
+    completion = client.chat.completions.create(
+        model=GROQ_MODEL,
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.2,
+    )
+    text = completion.choices[0].message.content
+    if not text:
+        raise RuntimeError("Groq returned an empty response.")
+    return text
+
+
+def _placeholder_review(chunks: List[str]) -> str:
+    chunk_list = ""
+    for i, chunk in enumerate(chunks, 1):
+        first_line = chunk.strip().splitlines()[0] if chunk.strip() else "<empty>"
+        chunk_list += f"- **Chunk {i}:** `{first_line}`\n"
+    return f"{len(chunks)}\n\n{chunk_list}\n"
+
+
+_CORRECT_PROMPT = """\
+You are an expert Python developer. Your task is to fix ALL bugs, errors, and \
+code quality issues in the Python code below.
+
+Rules you MUST follow:
+1. Return ONLY the corrected Python source code -- no explanations, no markdown \
+fences, no prose.
+2. Fix every bug, logic error, unhandled edge case, PEP 8 violation, and \
+naming issue you find.
+3. Do NOT add new features; only correct existing code.
+4. Preserve the original structure, function names, and variable names unless \
+a name itself is the bug.
+
+--- ORIGINAL CODE ---
+{original_code}
+---------------------
+
+Output the corrected Python code only."""
+
+
 def generate_corrected_code(original_code: str) -> str:
+    """Return a corrected version of original_code using Groq."""
     if not original_code.strip():
         return original_code
 
@@ -253,3 +282,10 @@ def generate_corrected_code(original_code: str) -> str:
 
     logger.info("Groq unavailable -- returning original code unchanged.")
     return original_code
+'''
+
+with open(DEST, "w", encoding="utf-8") as f:
+    f.write(CONTENT)
+
+size = os.path.getsize(DEST)
+print(f"Written {size} bytes to {DEST}")

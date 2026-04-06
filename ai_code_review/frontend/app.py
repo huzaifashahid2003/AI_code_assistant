@@ -1,65 +1,18 @@
-"""
-app.py — Streamlit frontend for AI Code Review Assistant.
-
-Features:
-    - Upload a Python (.py) file (or use built-in sample code).
-    - Enter a review query and click "Analyze Code".
-    - Sends the file to FastAPI /upload, then calls /review for AI feedback.
-    - Displays review suggestions as rendered Markdown.
-    - Lets the user download the review as a .txt file.
-"""
-
 from pathlib import Path
 
 import requests
 import streamlit as st
 
-# ---------------------------------------------------------------------------
-# Config
-# ---------------------------------------------------------------------------
-
 BACKEND_URL = "http://localhost:8000"
 UPLOADS_DIR = Path(__file__).resolve().parent.parent / "data" / "uploads"
 UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
 
-SAMPLE_FILENAME = "sample_code.py"
-SAMPLE_CODE = """\
-def add(a, b):
-    return a + b
-
-
-def divide(a, b):
-    return a / b  # potential ZeroDivisionError — no guard for b == 0
-
-
-class Calculator:
-    def __init__(self):
-        self.history = []
-
-    def compute(self, op, a, b):
-        if op == "add":
-            result = add(a, b)
-        elif op == "divide":
-            result = divide(a, b)
-        else:
-            result = None
-        self.history.append((op, a, b, result))
-        return result
-"""
-
-# ---------------------------------------------------------------------------
-# Helper functions
-# ---------------------------------------------------------------------------
-
-
 def save_file_locally(filename: str, content: bytes) -> None:
-    """Persist uploaded file bytes to the local uploads directory."""
     dest = UPLOADS_DIR / Path(filename).name
     dest.write_bytes(content)
 
 
 def upload_to_backend(filename: str, content: bytes) -> None:
-    """POST the file to the FastAPI /upload endpoint."""
     response = requests.post(
         f"{BACKEND_URL}/upload",
         files={"file": (filename, content, "text/x-python")},
@@ -69,7 +22,6 @@ def upload_to_backend(filename: str, content: bytes) -> None:
 
 
 def request_review(filename: str, query: str) -> dict:
-    """POST to the FastAPI /review endpoint and return the JSON response."""
     response = requests.post(
         f"{BACKEND_URL}/review",
         json={"filename": filename, "query": query},
@@ -80,7 +32,6 @@ def request_review(filename: str, query: str) -> dict:
 
 
 def run_analysis(filename: str, content: bytes, query: str) -> None:
-    """Orchestrate upload → review and render results in the Streamlit UI."""
     with st.spinner("Uploading and analysing — this may take a few seconds..."):
         try:
             upload_to_backend(filename, content)
@@ -118,11 +69,8 @@ def run_analysis(filename: str, content: bytes, query: str) -> None:
     st.session_state["review_filename"] = filename
     st.session_state["review_total"] = total
     st.session_state["review_reviewed"] = reviewed
-
-
-# ---------------------------------------------------------------------------
-# Page layout
-# ---------------------------------------------------------------------------
+    st.session_state["corrected_code"] = data.get("corrected_code", "")
+    st.session_state["chunk_reviews"] = data.get("chunk_reviews", [])
 
 st.set_page_config(
     page_title="AI Code Review Assistant",
@@ -133,7 +81,6 @@ st.set_page_config(
 st.title("🔍 AI Code Review Assistant")
 st.caption("Upload a Python file and get an AI-powered code review instantly.")
 
-# Initialise session state keys
 if "review_text" not in st.session_state:
     st.session_state["review_text"] = ""
 if "review_filename" not in st.session_state:
@@ -142,10 +89,13 @@ if "review_total" not in st.session_state:
     st.session_state["review_total"] = "?"
 if "review_reviewed" not in st.session_state:
     st.session_state["review_reviewed"] = "?"
+if "corrected_code" not in st.session_state:
+    st.session_state["corrected_code"] = ""
+if "chunk_reviews" not in st.session_state:
+    st.session_state["chunk_reviews"] = []
 
 st.divider()
 
-# --- File upload ---
 uploaded_file = st.file_uploader(
     "Upload a Python file (.py)",
     type=["py"],
@@ -193,8 +143,6 @@ if st.button("Analyze Code", type="primary"):
             "No file selected. Upload a .py file or check "
             "'Use built-in sample code instead'."
         )
-
-# --- Review results (rendered after analysis or from session state) ---
 if st.session_state["review_text"]:
     st.divider()
     total = st.session_state["review_total"]
@@ -204,13 +152,73 @@ if st.session_state["review_text"]:
     st.success(f"Review complete — {reviewed} of {total} code chunk(s) analysed from `{fname}`.")
 
     st.subheader("Review Suggestions")
-    st.markdown(st.session_state["review_text"])
+
+    chunk_reviews = st.session_state.get("chunk_reviews", [])
+    if chunk_reviews:
+        _SEVERITY_ICON = {"high": "🔴", "medium": "🟡", "low": "🟢", "none": "✅"}
+        for rev in chunk_reviews:
+            icon = _SEVERITY_ICON.get(rev.get("severity", "none"), "⚪")
+            label = (
+                f"{icon} `{rev['chunk_name']}` "
+                f"({rev['chunk_type']}) — "
+                f"Lines {rev['start_line']}–{rev['end_line']} — "
+                f"severity: **{rev['severity']}**"
+            )
+            with st.expander(label, expanded=(rev.get("severity") in {"high", "medium"})):
+                # ── Source code with line-by-line highlighting ──────────────
+                source_lines = rev["source"].splitlines()
+                start = rev["start_line"]
+                bad = set(rev.get("problematic_lines", []))
+
+                html_parts = [
+                    '<div style="'
+                    'font-family:monospace;font-size:13px;line-height:1.7;'
+                    'background:#0e1117;border-radius:6px;padding:8px 4px;'
+                    'overflow-x:auto;">'
+                ]
+                for i, line in enumerate(source_lines):
+                    lineno = start + i
+                    # Escape HTML special characters
+                    escaped = (
+                        line
+                        .replace("&", "&amp;")
+                        .replace("<", "&lt;")
+                        .replace(">", "&gt;")
+                    )
+                    if lineno in bad:
+                        html_parts.append(
+                            f'<div style="background:rgba(255,80,80,0.18);'
+                            f'border-left:3px solid #e05252;padding:1px 8px;border-radius:2px">'
+                            f'<span style="color:#e05252;min-width:38px;display:inline-block">'
+                            f'{lineno}</span>'
+                            f'<span style="color:#ff6b6b"> 🔴 {escaped}</span>'
+                            f'</div>'
+                        )
+                    else:
+                        html_parts.append(
+                            f'<div style="padding:1px 8px">'
+                            f'<span style="color:#555;min-width:38px;display:inline-block">'
+                            f'{lineno}</span>'
+                            f'<span style="color:#cdd3de"> {escaped}</span>'
+                            f'</div>'
+                        )
+                html_parts.append("</div>")
+                st.markdown("".join(html_parts), unsafe_allow_html=True)
+
+                # ── Structured feedback below the code block ─────────────
+                st.markdown(f"**Issue:** {rev['issue']}")
+                st.markdown(f"**Suggestion:** {rev['suggestion']}")
+    else:
+        # Fallback: render the plain markdown review if no per-chunk data
+        st.markdown(st.session_state["review_text"])
 
     st.divider()
-    st.download_button(
-        label="⬇️  Download Review (.txt)",
-        data=st.session_state["review_text"],
-        file_name=f"review_{Path(fname).stem}.txt",
-        mime="text/plain",
-        help="Save the full review report as a plain-text file.",
-    )
+    corrected = st.session_state.get("corrected_code", "")
+    if corrected:
+        st.download_button(
+            label="⬇️  Download correct.py",
+            data=corrected,
+            file_name=f"correct_{Path(fname).stem}.py",
+            mime="text/x-python",
+            help="Download the corrected Python file with all issues fixed.",
+        )
