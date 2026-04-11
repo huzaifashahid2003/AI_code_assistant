@@ -1,0 +1,30 @@
+# Git
+.git
+.gitignore
+
+# Python cache
+__pycache__
+*.py[cod]
+*.pyo
+.pytest_cache
+.mypy_cache
+.ruff_cache
+
+# Virtual environments
+.venv
+venv
+env
+
+# Uploaded files (mounted as a volume at runtime)
+data/uploads/*
+
+# OS artefacts
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode
+.idea
+
+# Docs / misc
+*.md
