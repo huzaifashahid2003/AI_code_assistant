@@ -35,6 +35,43 @@ class CodeChunk:
         }
 
 
+def _split_by_lines(
+    code_text: str,
+    chunk_size: int = 50,
+    overlap: int = 10,
+) -> List[CodeChunk]:
+    """Fallback chunker: split source into overlapping fixed-size line windows.
+
+    Used when the file contains no top-level function or class definitions
+    (e.g. plain scripts, config files, or files that failed AST parsing).
+    Each chunk is named ``block_N`` and typed ``"block"``.
+    """
+    lines = code_text.splitlines(keepends=True)
+    if not lines:
+        return []
+
+    chunks: List[CodeChunk] = []
+    step = max(1, chunk_size - overlap)
+
+    for block_idx, start_idx in enumerate(range(0, len(lines), step)):
+        end_idx = min(start_idx + chunk_size, len(lines))
+        source = "".join(lines[start_idx:end_idx])
+        chunks.append(
+            CodeChunk(
+                name=f"block_{block_idx}",
+                chunk_type="block",
+                source=source,
+                start_line=start_idx + 1,   # 1-based
+                end_line=end_idx,            # 1-based inclusive
+                docstring=None,
+            )
+        )
+        if end_idx >= len(lines):
+            break
+
+    return chunks
+
+
 def chunk_code(code_text: str) -> List[CodeChunk]:
     """Split Python source into top-level function/class chunks.
 
@@ -72,6 +109,10 @@ def chunk_code(code_text: str) -> List[CodeChunk]:
                 docstring=docstring,
             )
         )
+
+    # Fallback: no top-level defs found — split by overlapping line windows
+    if not chunks:
+        return _split_by_lines(code_text)
 
     return chunks
 

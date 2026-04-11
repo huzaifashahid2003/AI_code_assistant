@@ -9,15 +9,13 @@ streamlit>=1.33.0
 requests>=2.31.0
 
 # ── Embeddings & Vector Store ────────────────────────────────────────────────
-# Pure-numpy TF-IDF — no FAISS or external vector DB required
+# Sentence-transformer model: all-MiniLM-L6-v2 (~90 MB, downloaded on first use)
+sentence-transformers>=2.7.0
 numpy>=1.26.0
 
 # ── LLM Integration (Groq) ──────────────────────────────────────────────────
 groq>=1.1.0
 python-dotenv>=1.0.0
-
-# ── Embeddings (pure-numpy TF-IDF, no extra packages needed) ────────────────
-# scikit-learn is optional; install if disk space allows: pip install scikit-learn
 
 # ── Dev / Testing ────────────────────────────────────────────────────────────
 pytest>=8.2.0

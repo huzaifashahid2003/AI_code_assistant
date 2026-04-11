@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import os
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from fastapi import APIRouter, File, HTTPException, UploadFile
@@ -15,7 +16,7 @@ from fastapi import APIRouter, File, HTTPException, UploadFile
 from app.core.config import MAX_FILE_SIZE, UPLOAD_DIR
 from app.models.schemas import ReviewRequest, ReviewResponse, UploadResponse
 from app.services.correction_service import generate_corrected_code
-from app.services.rag_service import build_tfidf_index, retrieve_relevant_chunks
+from app.services.rag_service import get_or_build_index, retrieve_relevant_chunks
 from app.services.review_service import generate_code_review, review_chunk
 from app.utils.code_processing import chunk_code
 
@@ -118,8 +119,9 @@ def review_file(request: ReviewRequest) -> ReviewResponse:
         for c in chunks
     ]
 
-    # ── Retrieve — index-based, no fragile string mapping ─────────────────
-    store = build_tfidf_index(chunk_sources)
+    # ── Embedding-based retrieval (cached per file mtime) ─────────────────
+    mtime = file_path.stat().st_mtime
+    store = get_or_build_index(safe_name, mtime, chunk_sources)
     indices = retrieve_relevant_chunks(store, request.query)
 
     relevant_sources = [chunk_sources[i] for i in indices]
@@ -131,11 +133,18 @@ def review_file(request: ReviewRequest) -> ReviewResponse:
         safe_name, len(relevant_sources),
     )
     review_text = generate_code_review(relevant_sources)
-    chunk_reviews = [review_chunk(c) for c in relevant_chunk_objs]
 
-    # ── Correct ───────────────────────────────────────────────────────────
-    logger.info("Generating corrected code for '%s'.", safe_name)
-    corrected_code = generate_corrected_code(code_text)
+    # Batch per-chunk review calls concurrently (independent Groq requests)
+    max_workers = min(5, len(relevant_chunk_objs))
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        chunk_reviews = list(pool.map(review_chunk, relevant_chunk_objs))
+
+    # ── Correct (retrieved sections only — focused, token-efficient) ──────
+    logger.info(
+        "Generating corrected code for '%s' (%d section(s)).",
+        safe_name, len(relevant_sources),
+    )
+    corrected_code = generate_corrected_code(relevant_sources)
 
     # ── AI availability flag ───────────────────────────────────────────────
     ai_used = bool(os.environ.get("GROQ_API_KEY"))

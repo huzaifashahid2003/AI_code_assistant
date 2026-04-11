@@ -1,101 +1,156 @@
 """
-rag_service.py — TF-IDF vector store and retrieval.
+rag_service.py — Embedding-based retrieval for code chunks.
 
-Pure-numpy implementation; no FAISS or external embedding libraries required.
-Retrieval returns chunk indices so callers can index into any parallel list
-(source strings, CodeChunk objects) without a fragile string-mapping step.
+Pipeline
+--------
+1. Bi-encoder (all-MiniLM-L6-v2, ~90 MB): each code chunk is encoded into a
+   384-dimensional L2-normalised vector once per file.  The index is cached in
+   memory and only rebuilt when the file changes (mtime-based invalidation).
+2. Coarse retrieval: top-(k × 3) candidates by cosine similarity (dot product).
+3. Cross-encoder reranking (cross-encoder/ms-marco-MiniLM-L-6-v2, ~70 MB):
+   reorders candidates by fine-grained relevance.  Falls back silently to the
+   bi-encoder ranking when the reranker is unavailable.
 """
 from __future__ import annotations
 
-import math
-import re
-from collections import Counter
-from dataclasses import dataclass, field
-from typing import Any, List
+import logging
+from dataclasses import dataclass
+from functools import lru_cache
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
+from sentence_transformers import SentenceTransformer
 
-from app.core.config import TFIDF_MAX_FEATURES
+logger = logging.getLogger(__name__)
+
+_EMBED_MODEL = "all-MiniLM-L6-v2"
+_RERANK_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+
+# ---------------------------------------------------------------------------
+# Model helpers (loaded once, cached for the lifetime of the process)
+# ---------------------------------------------------------------------------
+
+@lru_cache(maxsize=1)
+def _get_encoder() -> SentenceTransformer:
+    """Load and cache the bi-encoder (downloaded once, ~90 MB)."""
+    logger.info("Loading bi-encoder model '%s'.", _EMBED_MODEL)
+    return SentenceTransformer(_EMBED_MODEL)
 
 
-class _TFIDFVectorizer:
-    """Minimal TF-IDF vectorizer built on numpy + Python builtins only."""
+@lru_cache(maxsize=1)
+def _get_reranker() -> Optional[object]:
+    """Load and cache the cross-encoder for reranking (optional, ~70 MB).
 
-    def __init__(self, max_features: int = TFIDF_MAX_FEATURES) -> None:
-        self.max_features = max_features
-        self.vocabulary_: dict = {}
-        self.idf_: np.ndarray = np.array([], dtype=np.float32)
+    Returns None if the model is unavailable so callers degrade gracefully.
+    """
+    try:
+        from sentence_transformers import CrossEncoder  # type: ignore[attr-defined]
+        logger.info("Loading cross-encoder reranker '%s'.", _RERANK_MODEL)
+        return CrossEncoder(_RERANK_MODEL)
+    except Exception as exc:
+        logger.warning("Cross-encoder reranker unavailable: %s", exc)
+        return None
 
-    @staticmethod
-    def _tokenize(text: str) -> List[str]:
-        return re.findall(r"\b[a-zA-Z_][a-zA-Z0-9_]*\b", text.lower())
 
-    def fit_transform(self, texts: List[str]) -> np.ndarray:
-        tokenized = [self._tokenize(t) for t in texts]
-        n_docs = len(tokenized)
-
-        df: Counter = Counter()
-        for tokens in tokenized:
-            df.update(set(tokens))
-
-        top_terms = [term for term, _ in df.most_common(self.max_features)]
-        self.vocabulary_ = {term: i for i, term in enumerate(top_terms)}
-        vocab_size = len(self.vocabulary_)
-
-        self.idf_ = np.zeros(vocab_size, dtype=np.float32)
-        for term, idx in self.vocabulary_.items():
-            self.idf_[idx] = math.log((1 + n_docs) / (1 + df[term])) + 1.0
-
-        return self._vectorize(tokenized)
-
-    def transform(self, texts: List[str]) -> np.ndarray:
-        return self._vectorize([self._tokenize(t) for t in texts])
-
-    def _vectorize(self, tokenized: List[List[str]]) -> np.ndarray:
-        vocab_size = len(self.vocabulary_)
-        mat = np.zeros((len(tokenized), vocab_size), dtype=np.float32)
-        for i, tokens in enumerate(tokenized):
-            tf = Counter(tokens)
-            for term, count in tf.items():
-                if term in self.vocabulary_:
-                    mat[i, self.vocabulary_[term]] = (
-                        count * self.idf_[self.vocabulary_[term]]
-                    )
-            norm = float(np.linalg.norm(mat[i]))
-            if norm > 0.0:
-                mat[i] /= norm
-        return mat
-
+# ---------------------------------------------------------------------------
+# Vector store
+# ---------------------------------------------------------------------------
 
 @dataclass
 class VectorStore:
-    matrix: np.ndarray    # shape (n_chunks, vocab_size), L2-normalised rows
+    """L2-normalised dense embeddings alongside the original chunk strings."""
+
+    embeddings: np.ndarray   # shape (n_chunks, 384)
     chunks: List[str]
-    vectorizer: Any = field(default=None)
 
 
-def build_tfidf_index(chunks: List[str]) -> VectorStore:
-    """Fit a TF-IDF vectorizer on *chunks* and return a VectorStore."""
+# ---------------------------------------------------------------------------
+# In-memory index cache  —  filename → (mtime, VectorStore)
+# ---------------------------------------------------------------------------
+
+_index_cache: Dict[str, Tuple[float, VectorStore]] = {}
+
+
+def get_or_build_index(filename: str, mtime: float, chunks: List[str]) -> VectorStore:
+    """Return a cached VectorStore for *filename* or build and cache a fresh one.
+
+    The cache entry is invalidated whenever *mtime* changes, so a re-uploaded
+    file always gets a freshly encoded index.
+    """
+    cached = _index_cache.get(filename)
+    if cached is not None and cached[0] == mtime:
+        logger.debug("Embedding cache hit for '%s' (mtime=%.3f).", filename, mtime)
+        return cached[1]
+
+    logger.info(
+        "Building embedding index for '%s' (%d chunk(s)).", filename, len(chunks)
+    )
+    store = _build_index(chunks)
+    _index_cache[filename] = (mtime, store)
+    return store
+
+
+def _build_index(chunks: List[str]) -> VectorStore:
+    """Encode *chunks* with the bi-encoder and return a VectorStore."""
     if not chunks:
         raise ValueError("Cannot create a vector store from an empty chunk list.")
-    vec = _TFIDFVectorizer(max_features=TFIDF_MAX_FEATURES)
-    matrix = vec.fit_transform(chunks)
-    return VectorStore(matrix=matrix, chunks=chunks, vectorizer=vec)
+    encoder = _get_encoder()
+    embeddings: np.ndarray = encoder.encode(
+        chunks,
+        convert_to_numpy=True,
+        normalize_embeddings=True,   # L2 normalise → cosine = dot product
+        show_progress_bar=False,
+    )
+    return VectorStore(embeddings=embeddings, chunks=chunks)
 
 
-def retrieve_relevant_chunks(store: VectorStore, query: str, k: int = 5) -> List[int]:
-    """Return indices of the top-k chunks most similar to *query*.
+# ---------------------------------------------------------------------------
+# Retrieval + reranking
+# ---------------------------------------------------------------------------
 
-    Uses cosine similarity (dot product on L2-normalised vectors).
-    Returns plain Python ints so callers can directly index into any parallel
-    list without a separate string-to-object mapping step.
+def retrieve_relevant_chunks(
+    store: VectorStore,
+    query: str,
+    k: int = 5,
+    rerank: bool = True,
+) -> List[int]:
+    """Return indices of the top-k most relevant chunks for *query*.
+
+    Steps:
+      1. Bi-encoder coarse pass: score all chunks by cosine similarity,
+         keep top min(k*3, n) candidates.
+      2. Cross-encoder reranking: reorder candidates by a fine-grained
+         relevance score.  Skipped when the reranker is unavailable.
+
+    Returns plain Python ints for direct indexing into parallel lists.
     """
-    k = min(k, len(store.chunks))
-    if store.vectorizer is not None:
-        query_vec = store.vectorizer.transform([query])   # (1, vocab_size)
-    else:
-        query_vec = np.zeros((1, store.matrix.shape[1]), dtype=np.float32)
+    n = len(store.chunks)
+    k = min(k, n)
 
-    scores = store.matrix.dot(query_vec[0])               # (n_chunks,)
-    top_indices = np.argsort(scores)[::-1][:k]
-    return top_indices.tolist()                            # numpy int64 → int
+    # ── 1. Coarse bi-encoder retrieval ────────────────────────────────────
+    encoder = _get_encoder()
+    query_emb: np.ndarray = encoder.encode(
+        [query],
+        convert_to_numpy=True,
+        normalize_embeddings=True,
+        show_progress_bar=False,
+    )
+    scores = store.embeddings.dot(query_emb[0])   # (n_chunks,) cosine similarities
+
+    candidate_k = min(k * 3, n)
+    candidate_indices: List[int] = np.argsort(scores)[::-1][:candidate_k].tolist()
+
+    # ── 2. Cross-encoder reranking (optional) ─────────────────────────────
+    if rerank and len(candidate_indices) > k:
+        reranker = _get_reranker()
+        if reranker is not None:
+            pairs = [(query, store.chunks[idx]) for idx in candidate_indices]
+            rerank_scores = reranker.predict(pairs)
+            reranked = sorted(
+                zip(candidate_indices, rerank_scores),
+                key=lambda x: x[1],
+                reverse=True,
+            )
+            return [int(idx) for idx, _ in reranked[:k]]
+
+    return [int(i) for i in candidate_indices[:k]]

@@ -11,7 +11,6 @@ load_dotenv(BASE_DIR / ".env")
 
 GROQ_API_KEY: str = os.environ.get("GROQ_API_KEY", "")
 GROQ_MODEL: str = "llama-3.3-70b-versatile"
-TFIDF_MAX_FEATURES: int = 512
 MAX_FILE_SIZE: int = 200_000  # ~200 KB upper bound for uploaded source files
 
 UPLOAD_DIR: Path = BASE_DIR / "data" / "uploads"

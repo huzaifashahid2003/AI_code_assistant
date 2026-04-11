@@ -1,6 +1,6 @@
 ﻿# AI Code Review Assistant
 
-An AI-powered code review tool that analyses Python source files and produces a structured, section-by-section review report using a **Retrieval-Augmented Generation (RAG)** pipeline backed by **Groq (Llama 3.3 70B)**.
+This system analyses a single Python file by decomposing it into **AST-based code units**, retrieving relevant context using **semantic similarity** (sentence-transformer embeddings), and generating structured feedback using a **Large Language Model (Groq — Llama 3.3 70B)**.
 
 > Upload any `.py` file → get an AI review with severity ratings, exact line references, and a fully corrected version ready to download.
 
@@ -18,7 +18,7 @@ An AI-powered code review tool that analyses Python source files and produces a 
 - **AI-generated corrected code** — the backend returns a fully fixed version of the uploaded file
 - **Line-level referencing** — suggestions cite exact function/class names and line ranges
 - **Download report** — export the review as a `.txt` file from the UI
-- **RAG pipeline** — relevant code chunks are retrieved via a pure-NumPy TF-IDF vector store before being sent to the LLM
+- **Embedding-based retrieval** — each upload is chunked, encoded into 384-dimensional dense vectors (`all-MiniLM-L6-v2`), and the top-k most semantically relevant chunks are retrieved and reranked before being sent to the LLM; the index is **cached in memory per file** so repeated requests skip re-encoding
 - **Graceful fallback** — runs in placeholder mode when no API key is configured
 - **Structured error handling** — empty files, invalid types, encoding errors, and API failures all return clear messages
 - **Server-side logging** — every upload, chunk count, and review generation is logged
@@ -32,11 +32,54 @@ An AI-powered code review tool that analyses Python source files and produces a 
 | Backend API | FastAPI + Uvicorn |
 | Frontend | Streamlit |
 | Code Parsing | Python `ast` (built-in) |
-| Embeddings & Vector Search | Pure-NumPy TF-IDF (`numpy`) |
+| Embeddings & Vector Search | `sentence-transformers` — `all-MiniLM-L6-v2` (384-dim dense) |
 | LLM | Groq — `llama-3.3-70b-versatile` |
 | HTTP client (frontend) | `requests` |
 | Validation | Pydantic v2 |
 | Containerisation | Docker + Docker Compose |
+
+---
+
+## Pipeline Overview
+
+```
+  Uploaded .py file
+         │
+         ▼
+  ┌─────────────────────────────┐
+  │  1. AST Chunking            │  chunk_code() splits into top-level
+  │     (code_processing.py)    │  functions/classes → fallback to
+  │                             │  overlapping 50-line windows if none
+  └─────────────┬───────────────┘
+                │  List[CodeChunk]
+                ▼
+  ┌─────────────────────────────┐
+  │  2. Dense Embedding         │  all-MiniLM-L6-v2 encodes each chunk into a
+  │     (rag_service.py)        │  384-dim L2-normalised vector.
+  │                             │  Index cached by filename + mtime —
+  │                             │  re-upload invalidates; repeat hits cache.
+  └─────────────┬───────────────┘
+                │  VectorStore (numpy matrix)
+                ▼
+  ┌─────────────────────────────┐
+  │  3. Retrieval + Reranking   │  Bi-encoder coarse pass: top k×3 candidates
+  │     (rag_service.py)        │  by cosine similarity.
+  │                             │  Cross-encoder reranker refines to top-k.
+  └─────────────┬───────────────┘
+                │  top-k relevant CodeChunks
+                ▼
+  ┌─────────────────────────────┐
+  │  4. LLM Review & Correction │  Groq (Llama 3.3 70B) receives retrieved
+  │     (review_service.py      │  chunks + query → structured review.
+  │      correction_service.py) │  Per-chunk calls run concurrently.
+  │                             │  Correction targets retrieved sections only.
+  └─────────────────────────────┘
+                │
+                ▼
+     Structured ReviewResponse
+     (chunk_reviews, corrected_code,
+      severity, problematic_lines…)
+```
 
 ---
 
@@ -55,7 +98,7 @@ ai_code_review/
 │       ├── models/
 │       │   └── schemas.py             # Pydantic request/response models
 │       ├── services/
-│       │   ├── rag_service.py         # TF-IDF vector store + cosine retrieval
+│       │   ├── rag_service.py         # Embedding-based retrieval (bi-encoder + cross-encoder reranker)
 │       │   ├── review_service.py      # Per-chunk + full-file LLM review
 │       │   └── correction_service.py  # AI-powered code correction via Groq
 │       └── utils/
@@ -278,7 +321,7 @@ FastAPI application entry point. Configures CORS middleware, logging, and mounts
 All route handlers — `/` (health), `/upload`, and `/review`. Applies input validation (query blank check, file size limit, path-traversal prevention) then orchestrates the pipeline: chunking → vector index → retrieval → review → correction.
 
 ### `backend/app/core/config.py`
-Centralised settings: `GROQ_MODEL`, `TFIDF_MAX_FEATURES`, `MAX_FILE_SIZE` (200 KB), `UPLOAD_DIR`. Loads `.env` at import time.
+Centralised settings: `GROQ_MODEL`, `MAX_FILE_SIZE` (200 KB), `UPLOAD_DIR`. Loads `.env` at import time.
 
 ### `backend/app/core/logging.py`
 Configures the root logger to stdout with a consistent timestamp format.
@@ -296,10 +339,11 @@ Configures the root logger to stdout with a consistent timestamp format.
 
 | Symbol | Description |
 |---|---|
-| `_TFIDFVectorizer` | Pure-NumPy TF-IDF vectorizer (no sklearn required) |
-| `VectorStore` | Dataclass holding the L2-normalised TF-IDF matrix + chunk list |
-| `build_tfidf_index(chunks)` | Fit vectorizer on chunks and return a `VectorStore` |
-| `retrieve_relevant_chunks(store, query, k)` | Cosine-similarity retrieval — returns top-k **indices** |
+| `_get_encoder()` | Lazy-loads and caches the `all-MiniLM-L6-v2` bi-encoder (run once, ~90 MB) |
+| `_get_reranker()` | Lazy-loads the cross-encoder reranker `ms-marco-MiniLM-L-6-v2` (~70 MB); returns `None` if unavailable |
+| `VectorStore` | Dataclass holding L2-normalised embeddings (shape `n_chunks × 384`) + chunk strings |
+| `get_or_build_index(filename, mtime, chunks)` | Return cached `VectorStore` or build fresh; invalidated on mtime change |
+| `retrieve_relevant_chunks(store, query, k, rerank)` | Bi-encoder coarse pass → cross-encoder reranking → return top-k **indices** |
 
 ### `backend/app/services/review_service.py`
 
@@ -312,14 +356,15 @@ Configures the root logger to stdout with a consistent timestamp format.
 
 | Symbol | Description |
 |---|---|
-| `generate_corrected_code(code_text)` | Call Groq to return a fully corrected version of the source; falls back to original if Groq is unavailable |
+| `generate_corrected_code(relevant_sources)` | Send only the retrieved sections to Groq for correction; falls back to sections unchanged if Groq is unavailable |
 
 ### `backend/app/utils/code_processing.py`
 
 | Symbol | Description |
 |---|---|
 | `CodeChunk` | Dataclass: `name`, `chunk_type`, `source`, `start_line`, `end_line`, `docstring` |
-| `chunk_code(code_text)` | Parse source with `ast` → list of `CodeChunk` (top-level functions and classes) |
+| `chunk_code(code_text)` | Parse source with `ast` → top-level functions/classes; falls back to overlapping line windows (`block_N`) for files with no definitions |
+| `_split_by_lines(code_text, chunk_size, overlap)` | Fallback line-window chunker (50-line windows, 10-line overlap) |
 
 ### `frontend/app.py`
 Streamlit UI — file upload, backend calls, per-chunk severity display with red-highlighted problem lines, corrected code preview, and download button.
@@ -379,6 +424,8 @@ docker compose down
 | *"File too large"* | File must be under 200 KB |
 | *"No top-level functions or classes found"* | The file must contain at least one `def` or `class` |
 | Placeholder review shown | Set `GROQ_API_KEY` in `.env` and install `groq` (`pip install groq`) |
+| First request is slow (30-60 s) | `all-MiniLM-L6-v2` (~90 MB) is downloaded on first use; subsequent requests are fast |
+| `OSError: [Errno 28] No space left` | The model needs ~200 MB free disk space — clear some space and retry |
 | Backend returns `404` for `/review` | Upload the file via `/upload` (or the UI) before reviewing |
 | `ai_used: false` in response | `GROQ_API_KEY` is not set — the app runs in fallback mode |
 
