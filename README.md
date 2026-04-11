@@ -1,0 +1,395 @@
+﻿# AI Code Review Assistant
+
+An AI-powered code review tool that analyses Python source files and produces a structured, section-by-section review report using a **Retrieval-Augmented Generation (RAG)** pipeline backed by **Groq (Llama 3.3 70B)**.
+
+> Upload any `.py` file → get an AI review with severity ratings, exact line references, and a fully corrected version ready to download.
+
+---
+
+## Features
+
+- **Upload any `.py` file** or use the built-in sample to try it instantly
+- **Structured AI review** with four dedicated sections:
+  - Code Quality Issues
+  - Performance Improvements
+  - Naming & Style Suggestions
+  - Potential Bugs
+- **Per-chunk structured analysis** — each function/class gets its own severity rating (`high` / `medium` / `low` / `none`), issue description, actionable suggestion, and exact problematic line numbers
+- **AI-generated corrected code** — the backend returns a fully fixed version of the uploaded file
+- **Line-level referencing** — suggestions cite exact function/class names and line ranges
+- **Download report** — export the review as a `.txt` file from the UI
+- **RAG pipeline** — relevant code chunks are retrieved via a pure-NumPy TF-IDF vector store before being sent to the LLM
+- **Graceful fallback** — runs in placeholder mode when no API key is configured
+- **Structured error handling** — empty files, invalid types, encoding errors, and API failures all return clear messages
+- **Server-side logging** — every upload, chunk count, and review generation is logged
+
+---
+
+## Tech Stack
+
+| Layer | Technology |
+|---|---|
+| Backend API | FastAPI + Uvicorn |
+| Frontend | Streamlit |
+| Code Parsing | Python `ast` (built-in) |
+| Embeddings & Vector Search | Pure-NumPy TF-IDF (`numpy`) |
+| LLM | Groq — `llama-3.3-70b-versatile` |
+| HTTP client (frontend) | `requests` |
+| Validation | Pydantic v2 |
+| Containerisation | Docker + Docker Compose |
+
+---
+
+## Project Structure
+
+```
+ai_code_review/
+├── backend/
+│   └── app/
+│       ├── main.py                    # FastAPI entry point
+│       ├── api/
+│       │   └── routes.py              # /upload and /review route handlers
+│       ├── core/
+│       │   ├── config.py              # Centralised settings (paths, model, limits)
+│       │   └── logging.py             # Root logger configuration
+│       ├── models/
+│       │   └── schemas.py             # Pydantic request/response models
+│       ├── services/
+│       │   ├── rag_service.py         # TF-IDF vector store + cosine retrieval
+│       │   ├── review_service.py      # Per-chunk + full-file LLM review
+│       │   └── correction_service.py  # AI-powered code correction via Groq
+│       └── utils/
+│           └── code_processing.py     # AST-based code chunker (CodeChunk)
+├── frontend/
+│   └── app.py                         # Streamlit UI
+├── data/
+│   └── uploads/                       # Uploaded files stored here (auto-created)
+├── samples/
+│   └── sample_code.py                 # Demo file with intentional bugs
+├── tests/
+│   ├── conftest.py                    # pytest sys.path setup
+│   └── test_api.py                    # Integration tests
+├── .env                               # GROQ_API_KEY goes here
+├── Dockerfile
+├── docker-compose.yml
+├── requirements.txt
+└── README.md
+```
+
+---
+
+## Setup
+
+### Prerequisites
+
+- Python 3.10 or later
+- `pip`
+- A [Groq](https://console.groq.com/) API key for real AI reviews *(free tier available)*
+
+### 1. Clone / navigate to the project
+
+```bash
+cd ai_code_review
+```
+
+### 2. Install dependencies
+
+```bash
+pip install -r requirements.txt
+```
+
+### 3. Set the Groq API key
+
+Create a `.env` file in the `ai_code_review/` directory:
+
+```env
+GROQ_API_KEY=your_groq_api_key_here
+```
+
+Or export it as an environment variable:
+
+**Windows (PowerShell)**
+```powershell
+$env:GROQ_API_KEY = "your_groq_api_key_here"
+```
+
+**macOS / Linux**
+```bash
+export GROQ_API_KEY="your_groq_api_key_here"
+```
+
+> If the key is not set the app still runs, returning a placeholder review instead of a real AI response.
+
+---
+
+## How to Run
+
+> Open **two separate terminals** inside the `ai_code_review/` folder.
+
+### Terminal 1 — Start the FastAPI backend
+
+```powershell
+cd backend
+uvicorn app.main:app --reload --port 8000
+```
+
+Interactive API docs: <http://localhost:8000/docs>
+
+### Terminal 2 — Start the Streamlit frontend
+
+```powershell
+cd frontend
+streamlit run app.py
+```
+
+The UI opens automatically at <http://localhost:8501> (or `:8502` if 8501 is in use).
+
+---
+
+## Example Usage
+
+1. Open the Streamlit app at <http://localhost:8501>.
+2. Upload any `.py` file — or tick **Use built-in sample code** to try the demo immediately.
+3. Leave the default query or type your own (e.g. *"Find all potential bugs"*).
+4. Click **Analyze Code**.
+5. Read the structured AI review rendered on the page.
+6. Expand each per-chunk section to see severity rating, issue description, actionable suggestion, and exact problematic line numbers highlighted in red.
+7. Scroll to **Corrected Code** to preview the AI-fixed version of your file.
+8. Click **⬇️ Download `correct_<yourfilename>.py`** to save the corrected file to your Downloads folder.
+
+### Example review output
+
+```
+## 1. Code Quality Issues
+- **`read_config` (Lines 72-75):** File is opened without a context manager.
+  *Suggestion:* Use `with open(filepath) as f:` to ensure the file is always closed.
+
+## 2. Performance Improvements
+- **`sum_of_squares` (Lines 31-38):** Builds an intermediate list before summing.
+  *Suggestion:* Replace with `return sum(n * n for n in numbers)`.
+
+## 3. Naming & Style Suggestions
+- **`userAccount` (Lines 49-67):** Class name violates PascalCase convention.
+  *Suggestion:* Rename to `UserAccount`.
+
+## 4. Potential Bugs
+- **`divide` (Lines 22-24):** No guard against division by zero.
+  *Suggestion:* Add `if b == 0: raise ValueError("Divisor cannot be zero.")` before the division.
+```
+
+---
+
+## API Reference
+
+| Method | Endpoint  | Description |
+|--------|-----------|-------------|
+| GET    | `/`       | Health check |
+| POST   | `/upload` | Upload a `.py` file |
+| POST   | `/review` | Run an AI review on an uploaded file |
+
+### `GET /` — response
+
+```json
+{ "status": "ok", "message": "AI Code Review Assistant is running." }
+```
+
+### `POST /upload`
+
+**Request** — multipart form with a `.py` file:
+
+```bash
+curl -X POST http://localhost:8000/upload \
+     -F "file=@samples/sample_code.py"
+```
+
+**Response:**
+
+```json
+{
+  "filename": "sample_code.py",
+  "saved_to": "data/uploads/sample_code.py",
+  "status": "uploaded successfully"
+}
+```
+
+**Errors:**
+- `400` — file is not a `.py` file
+- `400` — file exceeds 200 KB limit
+
+---
+
+### `POST /review`
+
+**Request body:**
+
+```json
+{
+  "filename": "sample_code.py",
+  "query": "Find all bugs and style issues"
+}
+```
+
+```bash
+curl -X POST http://localhost:8000/review \
+     -H "Content-Type: application/json" \
+     -d '{"filename": "sample_code.py", "query": "Find all bugs and style issues"}'
+```
+
+**Response:**
+
+```json
+{
+  "filename": "sample_code.py",
+  "query": "Find all bugs and style issues",
+  "total_chunks": 8,
+  "reviewed_chunks": 8,
+  "review": "## 1. Code Quality Issues\n ...",
+  "chunk_reviews": [
+    {
+      "chunk_name": "divide",
+      "chunk_type": "function",
+      "start_line": 16,
+      "end_line": 18,
+      "source": "def divide(a, b):\n    return a / b\n",
+      "issue": "No guard against division by zero.",
+      "suggestion": "Add `if b == 0: raise ValueError(...)` before the division.",
+      "severity": "high",
+      "problematic_lines": [17]
+    }
+  ],
+  "corrected_code": "...",
+  "ai_used": true,
+  "fallback": false
+}
+```
+
+**Errors:**
+- `404` — file not found in uploads (upload it first)
+- `400` — empty query, empty file, encoding error, file too large, or no functions/classes found
+
+---
+
+## Module Overview
+
+### `backend/app/main.py`
+FastAPI application entry point. Configures CORS middleware, logging, and mounts the API router.
+
+### `backend/app/api/routes.py`
+All route handlers — `/` (health), `/upload`, and `/review`. Applies input validation (query blank check, file size limit, path-traversal prevention) then orchestrates the pipeline: chunking → vector index → retrieval → review → correction.
+
+### `backend/app/core/config.py`
+Centralised settings: `GROQ_MODEL`, `TFIDF_MAX_FEATURES`, `MAX_FILE_SIZE` (200 KB), `UPLOAD_DIR`. Loads `.env` at import time.
+
+### `backend/app/core/logging.py`
+Configures the root logger to stdout with a consistent timestamp format.
+
+### `backend/app/models/schemas.py`
+
+| Schema | Description |
+|---|---|
+| `ReviewRequest` | `filename` + `query` |
+| `UploadResponse` | `filename`, `saved_to`, `status` |
+| `ChunkReview` | Per-chunk result with `issue`, `suggestion`, `severity`, `problematic_lines` |
+| `ReviewResponse` | Full response including `review`, `chunk_reviews`, `corrected_code`, `ai_used`, `fallback` |
+
+### `backend/app/services/rag_service.py`
+
+| Symbol | Description |
+|---|---|
+| `_TFIDFVectorizer` | Pure-NumPy TF-IDF vectorizer (no sklearn required) |
+| `VectorStore` | Dataclass holding the L2-normalised TF-IDF matrix + chunk list |
+| `build_tfidf_index(chunks)` | Fit vectorizer on chunks and return a `VectorStore` |
+| `retrieve_relevant_chunks(store, query, k)` | Cosine-similarity retrieval — returns top-k **indices** |
+
+### `backend/app/services/review_service.py`
+
+| Symbol | Description |
+|---|---|
+| `review_chunk(chunk)` | Send a single `CodeChunk` to Groq; return structured dict with `issue`, `suggestion`, `severity`, `problematic_lines` |
+| `generate_code_review(chunks)` | Call Groq to produce the full structured Markdown review across all relevant chunks |
+
+### `backend/app/services/correction_service.py`
+
+| Symbol | Description |
+|---|---|
+| `generate_corrected_code(code_text)` | Call Groq to return a fully corrected version of the source; falls back to original if Groq is unavailable |
+
+### `backend/app/utils/code_processing.py`
+
+| Symbol | Description |
+|---|---|
+| `CodeChunk` | Dataclass: `name`, `chunk_type`, `source`, `start_line`, `end_line`, `docstring` |
+| `chunk_code(code_text)` | Parse source with `ast` → list of `CodeChunk` (top-level functions and classes) |
+
+### `frontend/app.py`
+Streamlit UI — file upload, backend calls, per-chunk severity display with red-highlighted problem lines, corrected code preview, and download button.
+
+---
+
+## Environment Variables
+
+| Variable | Required | Description |
+|---|---|---|
+| `GROQ_API_KEY` | Yes (for real reviews) | Your Groq API key — get one at [console.groq.com](https://console.groq.com/) |
+
+---
+
+## Docker
+
+### Prerequisites
+
+- [Docker Desktop](https://www.docker.com/products/docker-desktop/) (or Docker Engine + Compose plugin)
+
+### 1. Add your API key
+
+Create a `.env` file in `ai_code_review/`:
+
+```env
+GROQ_API_KEY=your_groq_api_key_here
+```
+
+### 2. Build and start both services
+
+```bash
+cd ai_code_review
+docker compose up --build
+```
+
+This starts:
+- **Backend** → <http://localhost:8000> (API docs at `/docs`)
+- **Frontend** → <http://localhost:8501>
+
+### 3. Stop the containers
+
+```bash
+docker compose down
+```
+
+> Uploaded files are stored in a named Docker volume (`ai_code_review_uploads`) so they persist across container restarts.
+
+---
+
+## Troubleshooting
+
+| Problem | Fix |
+|---|---|
+| *"Cannot reach the backend"* | Start the FastAPI server: `cd backend && uvicorn app.main:app --reload` |
+| *"No module named 'app'"* | You must run uvicorn from inside `backend/`, not from `ai_code_review/` |
+| *"Only Python (.py) files are accepted"* | Ensure you are uploading a `.py` file |
+| *"File too large"* | File must be under 200 KB |
+| *"No top-level functions or classes found"* | The file must contain at least one `def` or `class` |
+| Placeholder review shown | Set `GROQ_API_KEY` in `.env` and install `groq` (`pip install groq`) |
+| Backend returns `404` for `/review` | Upload the file via `/upload` (or the UI) before reviewing |
+| `ai_used: false` in response | `GROQ_API_KEY` is not set — the app runs in fallback mode |
+
+---
+
+## Running Tests
+
+```powershell
+cd ai_code_review
+pytest tests/
+```
+
+Tests cover: health check, upload validation (extension, size), review validation (empty query, missing file), full review flow, and `ai_used`/`fallback` flag correctness.
+
